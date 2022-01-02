@@ -2132,7 +2132,9 @@ void suspend_console(void)
 {
 	if (!console_suspend_enabled)
 		return;
+#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	printk("Suspending console(s) (use no_console_suspend to debug)\n");
+#endif
 	console_lock();
 	console_suspended = 1;
 	up_console_sem();

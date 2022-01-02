@@ -228,7 +228,9 @@ void thaw_processes(void)
 
 	oom_killer_enable();
 
+#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	pr_info("Restarting tasks ... ");
+#endif
 
 	__usermodehelper_set_disable_depth(UMH_FREEZING);
 	thaw_workqueues();
