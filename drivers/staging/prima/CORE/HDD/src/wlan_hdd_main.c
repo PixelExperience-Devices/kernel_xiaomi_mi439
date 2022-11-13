@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2012-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
  *
@@ -122,6 +123,9 @@ int wlan_hdd_ftm_start(hdd_context_t *pAdapter);
 #include "wlan_hdd_debugfs.h"
 #include "sapInternal.h"
 #include "wlan_hdd_request_manager.h"
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+#include "wlan_hdd_packet_filtering.h"
+#endif
 
 #ifdef MODULE
 #define WLAN_MODULE_NAME  module_name(THIS_MODULE)
@@ -214,6 +218,11 @@ static VOS_STATUS hdd_parse_ese_beacon_req(tANI_U8 *pValue,
 //wait time for beacon miss rate.
 #define BCN_MISS_RATE_TIME 500
 
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+static VOS_STATUS hdd_parse_pktfilter_params(tANI_U8 *pValue,
+                                     tPacketFilterCfg *pRequest);
+#endif
+
 /*
  * Android DRIVER command structures
  */
@@ -257,15 +266,21 @@ void hdd_set_wlan_suspend_mode(bool suspend);
 void hdd_set_vowifi_mode(hdd_context_t *hdd_ctx, bool enable);
 void hdd_set_olpc_mode(tHalHandle hHal, bool low_power);
 
-v_U16_t hdd_select_queue(struct net_device *dev,
-    struct sk_buff *skb
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0))
-    , void *accel_priv
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  struct net_device *sb_dev,
+			  select_queue_fallback_t fallback);
+
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  void *accel_priv, select_queue_fallback_t fallback);
+
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  void *accel_priv);
+#else
+uint16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb);
 #endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
-    , select_queue_fallback_t fallback
-#endif
-);
 
 #ifdef WLAN_FEATURE_PACKET_FILTERING
 static void hdd_set_multicast_list(struct net_device *dev);
@@ -4033,7 +4048,6 @@ int hdd_process_bt_sco_profile(hdd_context_t *hdd_ctx,
 static void hdd_init_sw_pta(hdd_context_t *hdd_ctx)
 {
 	init_completion(&hdd_ctx->sw_pta_comp);
-	wcnss_update_bt_profile();
 }
 
 static void hdd_deinit_sw_pta(hdd_context_t *hdd_ctx)
@@ -7297,6 +7311,45 @@ free_bcn_miss_rate_req:
             VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
                       FL("data:%s"), extra);
        }
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+       else if (strncmp(command, "setPktFilter", 12) == 0)
+       {
+           tANI_U8 *value = command;
+           tPacketFilterCfg *pRequest = NULL;
+           eHalStatus status = eHAL_STATUS_SUCCESS;
+
+           VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+                " Received Command to set / reset pkt filter %s: ", __func__);
+
+           pRequest = (tPacketFilterCfg *) kmalloc(sizeof(tPacketFilterCfg), GFP_KERNEL);
+
+           if (pRequest == NULL) {
+               ret = -EINVAL;
+               goto exit;
+           }
+
+           memset(pRequest, 0x00, sizeof(tPacketFilterCfg));
+           status = hdd_parse_pktfilter_params(value, pRequest);
+           if (eHAL_STATUS_SUCCESS != status)
+           {
+               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                  "%s: Failed to parse pkt Filterreq", __func__);
+               ret = -EINVAL;
+               kfree(pRequest);
+               goto exit;
+           }
+           status = wlan_hdd_set_filter(pAdapter, pRequest);
+           if (eHAL_STATUS_SUCCESS != status)
+           {
+               VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
+                  "%s: Failed to set DRIVER command", __func__);
+               ret = -EINVAL;
+               kfree(pRequest);
+               goto exit;
+           }
+           kfree(pRequest);
+       }
+#endif
        else {
            MTRACE(vos_trace(VOS_MODULE_ID_HDD,
                             TRACE_CODE_HDD_UNSUPPORTED_IOCTL,
@@ -7433,6 +7486,111 @@ int hdd_mon_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
   return 0;
 }
+
+static tANI_U8* remove_firstoccurence_of_spaces(tANI_U8 *inPtr)
+{
+    tANI_U8 *tPtr = NULL;
+
+    tPtr = strnchr(inPtr, strlen(inPtr), SPACE_ASCII_VALUE);
+    /*no argument after the command or argument is NULL*/
+    if (NULL == tPtr)
+    {
+        return inPtr;
+    }
+    /*no space after the command*/
+    else if (SPACE_ASCII_VALUE != *tPtr)
+    {
+        return NULL;
+    }
+
+    /*removing empty spaces*/
+    while ((SPACE_ASCII_VALUE  == *tPtr) && ('\0' !=  *tPtr)) tPtr++;
+
+    /*no argument followed by spaces*/
+    if ('\0' == *tPtr) return tPtr;
+
+    return tPtr;
+}
+
+#ifdef WLAN_FEATURE_PACKET_FILTERING
+/**---------------------------------------------------------------------------
+
+  brief hdd_parse_pktfilter_params() - Parse packet filter request
+
+  This function parse the packet filtere parameters in the format
+  setPktFilter<space><filterAction><space><filterId><space>numParams>
+  <space><sub-filters1>....<sub-filter Params>
+  <sub-filter> format: <protocolLayer><space><cmpFlag><space><dataOffset>
+                       <space><datalength><space><compareData><space><dataMask>
+  For example, setPkFilter 1 8 3 2 1 1 1 30 2 44 0 40.
+
+  \param  - pValue Pointer to data
+  \param  - pRequest output pointer to store parsed parameters
+
+  \return - 0 for success non-zero for failure
+
+  --------------------------------------------------------------------------*/
+static VOS_STATUS hdd_parse_pktfilter_params(tANI_U8 *pValue,
+                                     tPacketFilterCfg *pRequest)
+{
+    tANI_U8 *inPtr = pValue;
+    int j = 0, i = 0;
+    int v = 0;
+
+    if ((inPtr = remove_firstoccurence_of_spaces(inPtr)) == NULL) return -EINVAL;
+
+    /*getting the first three value i.e. fiter action, id and numparams*/
+    v = sscanf(inPtr, "%hhu %hhu %hhu",&pRequest->filterAction, &pRequest->filterId,
+                                 &pRequest->numParams);
+    if (3 != v) return -EINVAL;
+
+    if (pRequest->numParams > 5) return -EINVAL;
+
+    for(i = 0; i < 3 ; i++) {
+        if ((inPtr = remove_firstoccurence_of_spaces(inPtr)) == NULL) return -EINVAL;
+    }
+
+    for (j = 0; j < pRequest->numParams; j++)
+    {
+        /*getting the sub filter parameters based on numparams*/
+        v = sscanf(inPtr, "%hhu %hhu %hhu %hhu",&pRequest->paramsData[j].protocolLayer,
+                          &pRequest->paramsData[j].cmpFlag, &pRequest->paramsData[j].dataOffset,
+                          &pRequest->paramsData[j].dataLength);
+
+        if (4 != v) return -EINVAL;
+
+        for(i = 0; i < 4 ; i++) {
+            if ((inPtr = remove_firstoccurence_of_spaces(inPtr)) == NULL) return -EINVAL;
+        }
+
+        v = sscanf(inPtr, "%hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu",
+                          &pRequest->paramsData[j].compareData[0], &pRequest->paramsData[j].compareData[1],
+                          &pRequest->paramsData[j].compareData[2], &pRequest->paramsData[j].compareData[3],
+                          &pRequest->paramsData[j].compareData[4], &pRequest->paramsData[j].compareData[5],
+                          &pRequest->paramsData[j].compareData[6], &pRequest->paramsData[j].compareData[7]);
+        if (8 != v) return -EINVAL;
+
+        for(i = 0; i < 8 ; i++) {
+            if ((inPtr = remove_firstoccurence_of_spaces(inPtr)) == NULL) return -EINVAL;
+        }
+
+        v = sscanf(inPtr, "%hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu",
+                          &pRequest->paramsData[j].dataMask[0], &pRequest->paramsData[j].dataMask[1],
+                          &pRequest->paramsData[j].dataMask[2], &pRequest->paramsData[j].dataMask[3],
+                          &pRequest->paramsData[j].dataMask[4], &pRequest->paramsData[j].dataMask[5],
+                          &pRequest->paramsData[j].dataMask[6], &pRequest->paramsData[j].dataMask[7]);
+
+        if (8 != v) return -EINVAL;
+
+        for(i = 0; i < 8 ; i++) {
+            if ((inPtr = remove_firstoccurence_of_spaces(inPtr)) == NULL) return -EINVAL;
+        }
+
+    }
+
+    return VOS_STATUS_SUCCESS;
+}
+#endif
 
 #if defined(FEATURE_WLAN_ESE) && defined(FEATURE_WLAN_ESE_UPLOAD)
 /**---------------------------------------------------------------------------
@@ -8542,13 +8700,6 @@ int __hdd_stop (struct net_device *dev)
 
    pAdapter->dev->wireless_handlers = NULL;
 
-   /*
-    * Upon wifi turn off, DUT has to flush the scan results so if
-    * this is the last cli iface, flush the scan database.
-    */
-   if (!hdd_is_cli_iface_up(pHddCtx))
-       sme_ScanFlushResult(pHddCtx->hHal, 0);
-
    EXIT();
    return 0;
 }
@@ -8629,7 +8780,6 @@ static void __hdd_uninit (struct net_device *dev)
       /* after uninit our adapter structure will no longer be valid */
       pAdapter->dev = NULL;
       pAdapter->magic = 0;
-      pAdapter->pHddCtx = NULL;
    } while (0);
 
    EXIT();
@@ -10112,14 +10262,6 @@ hdd_adapter_t* hdd_open_adapter( hdd_context_t *pHddCtx, tANI_U8 session_type,
          pAdapter->device_mode = session_type;
 
          hdd_initialize_adapter_common(pAdapter);
-
-         status = hdd_sta_id_hash_attach(pAdapter);
-         if (VOS_STATUS_SUCCESS != status)
-         {
-             hddLog(VOS_TRACE_LEVEL_FATAL,
-                    FL("failed to attach hash for session %d"), session_type);
-             goto err_free_netdev;
-         }
 
          status = hdd_register_hostapd( pAdapter, rtnl_held );
          if( VOS_STATUS_SUCCESS != status )
@@ -11692,12 +11834,6 @@ VOS_STATUS hdd_start_all_adapters( hdd_context_t *pHddCtx )
          case WLAN_HDD_SOFTAP:
             if (pHddCtx->cfg_ini->sap_internal_restart) {
                 hdd_init_ap_mode(pAdapter, true);
-                status = hdd_sta_id_hash_attach(pAdapter);
-                if (VOS_STATUS_SUCCESS != status)
-                {
-                    hddLog(VOS_TRACE_LEVEL_FATAL,
-                         FL("failed to attach hash for"));
-                }
             }
             break;
 
@@ -12237,19 +12373,31 @@ static void hdd_set_multicast_list(struct net_device *dev)
   \return - ac, Queue Index/access category corresponding to UP in IP header 
   
   --------------------------------------------------------------------------*/
-v_U16_t hdd_select_queue(struct net_device *dev,
-    struct sk_buff *skb
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0))
-    , void *accel_priv
-#endif
-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3,14,0))
-    , select_queue_fallback_t fallback
-#endif
-)
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 struct net_device *sb_dev,
+			 select_queue_fallback_t fallback)
 {
-   return hdd_wmm_select_queue(dev, skb);
+	return hdd_wmm_select_queue(dev, skb);
 }
-
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 void *accel_priv, select_queue_fallback_t fallback)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0))
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb,
+			 void *accel_priv)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#else
+v_U16_t hdd_select_queue(struct net_device *dev, struct sk_buff *skb)
+{
+	return hdd_wmm_select_queue(dev, skb);
+}
+#endif
 
 /**---------------------------------------------------------------------------
 
@@ -14154,6 +14302,7 @@ int hdd_wlan_startup(struct device *dev )
 #endif /* WLAN_KD_READY_NOTIFIER */
 
    vos_set_roam_delay_stats_enabled(pHddCtx->cfg_ini->gEnableRoamDelayStats);
+   hdd_init_sw_pta(pHddCtx);
    status = vos_open( &pVosContext, pHddCtx->parent_dev);
    if ( !VOS_IS_STATUS_SUCCESS( status ))
    {
@@ -14785,7 +14934,7 @@ int hdd_wlan_startup(struct device *dev )
 
    mutex_init(&pHddCtx->cache_channel_lock);
 
-   hdd_init_sw_pta(pHddCtx);
+   wcnss_update_bt_profile();
    goto success;
 
 #ifdef WLAN_LOGGING_SOCK_SVC_ENABLE
@@ -16263,8 +16412,12 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
    hdd_context_t *hdd_ctx = NULL;
    hdd_adapter_t *adapter = NULL;
    v_CONTEXT_t vos_context = NULL;
+   tANI_U8 type = 0;
+   tANI_U8 subType = 0;
    struct ieee80211_mgmt *mgmt =
            (struct ieee80211_mgmt *)frame_ind->frameBuf;
+   tANI_U8* pbFrames;
+   tANI_U32 nFrameLength;
 
    /* Get the global VOSS context.*/
    vos_context = vos_get_global_context(VOS_MODULE_ID_SYS, NULL);
@@ -16286,7 +16439,38 @@ void hdd_indicate_mgmt_frame(tSirSmeMgmtFrameInd *frame_ind)
         return;
    }
 
-   adapter = hdd_get_adapter_by_sme_session_id(hdd_ctx,
+   /* Try to retrieve the adapter from the mac address list*/
+     pbFrames = frame_ind->frameBuf;
+     type = WLAN_HDD_GET_TYPE_FRM_FC(pbFrames[0]);
+     subType = WLAN_HDD_GET_SUBTYPE_FRM_FC(pbFrames[0]);
+     nFrameLength = frame_ind->frameLen;
+
+    /* Get pAdapter from Destination mac address of the frame */
+    if ((type == SIR_MAC_MGMT_FRAME) &&
+        (subType != SIR_MAC_MGMT_PROBE_REQ) &&
+        (frame_ind->frameLen > WLAN_HDD_80211_FRM_DA_OFFSET + VOS_MAC_ADDR_SIZE)
+	&&
+        !vos_is_macaddr_broadcast(
+         (v_MACADDR_t *)&pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]))
+      {
+         adapter = hdd_get_adapter_by_macaddr(hdd_ctx,
+                               &pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]);
+         if (NULL == adapter)
+         {
+             /* Under assumtion that we don't receive any action frame
+              * with BCST as destination we dropping action frame
+              */
+             hddLog(VOS_TRACE_LEVEL_FATAL,"pAdapter for action frame is NULL Macaddr = "
+                               MAC_ADDRESS_STR ,
+                               MAC_ADDR_ARRAY(&pbFrames[WLAN_HDD_80211_FRM_DA_OFFSET]));
+             hddLog(VOS_TRACE_LEVEL_FATAL, "%s: Frame Type = %d Frame Length = %d"
+                              " subType = %d",__func__,frame_ind->frameType,nFrameLength,subType);
+             return;
+         }
+       }
+
+   if (adapter == NULL)
+       adapter = hdd_get_adapter_by_sme_session_id(hdd_ctx,
                                           frame_ind->sessionId);
 
    if ((NULL != adapter) &&
