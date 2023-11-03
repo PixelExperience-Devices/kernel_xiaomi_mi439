@@ -1,5 +1,5 @@
 # build
-build by Actions(https://github.com/Effectae/WT-Kernel-Action)
+build by [Actions](https://github.com/Effectae/WT-Kernel-Action)
 # Verssion : 1.0
 > 1.Added kernelsu
 > 
