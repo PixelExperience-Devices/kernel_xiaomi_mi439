@@ -12,4 +12,5 @@ Flash the kernel by TWRP
 ## Thanks
 
 -[Jprimero15](https://github.com/Jprimero15)
+-
 -[ lolz_kernel_redmi8](https://github.com/Jprimero15/lolz_kernel_redmi8)
