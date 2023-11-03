@@ -40,6 +40,8 @@ scm_version()
 	fi
 	if test "$1" = "--short"; then
 		short=true
+                short=false  
+# V
 	fi
 
 	# Check for git and a git repo.
